@@ -111,14 +111,14 @@ func main() {
 	httpHdlr.HandleFunc("GET /latest", httpHandler(wxFetch.httpEntry))
 
 	// start our fetcher for wx data from rtl_433
-	// go wxFetch.fetchRemoteWxData()
+	go wxFetch.fetchRemoteWxData()
 
 	httpServer := &http.Server{
-		Addr:    ":8081",
+		Addr:    ":8080",
 		Handler: httpHdlr,
 	}
 
-	log.Printf("listening on 8081")
+	log.Printf("listening on 8080")
 	err := httpServer.ListenAndServe()
 	if err != nil {
 		log.Fatalf("error with listening on http server: %s", err)
@@ -138,8 +138,6 @@ func (data *WxFetcher) httpEntry(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	log.Printf("http entry")
-
 	requestFromTime, err := strconv.Atoi(req.URL.Query().Get("from"))
 	if err != nil {
 		log.Printf("from time error.")
@@ -154,10 +152,8 @@ func (data *WxFetcher) httpEntry(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	log.Printf("before db read")
-
 	dbReadFull := db.Read(WXDB_FILENAME)
-	var wxDbData []WxBrunner7in1Retrieval
+	var wxDbData []WxProcessedRetrieval
 
 	log.Printf("after db read")
 
@@ -172,7 +168,7 @@ func (data *WxFetcher) httpEntry(res http.ResponseWriter, req *http.Request) {
 	var endIndex = len(wxDbData) - 1
 
 	for i, elem := range wxDbData {
-		if i%2 == 0 {
+		if i%4 == 0 {
 			continue
 		}
 
@@ -199,8 +195,6 @@ func (data *WxFetcher) httpEntry(res http.ResponseWriter, req *http.Request) {
 		res.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-
-	log.Printf("return size is %v", endIndex-startIndex)
 
 	res.Write([]byte(jsonStr))
 }
