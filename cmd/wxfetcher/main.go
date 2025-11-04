@@ -2,13 +2,19 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"log"
-	"math"
 	"net/http"
-	"strconv"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+
 	"time"
 	"wxdashboard/internal/db"
 	"wxdashboard/internal/utils"
+
+	"github.com/InfluxCommunity/influxdb3-go/v2/influxdb3"
 )
 
 type WxBrunner7in1Retrieval struct {
@@ -56,14 +62,40 @@ type MetricQueryTypeArray struct {
 }
 
 type WxFetcher struct {
-	LatestData WxProcessedRetrieval
+	LatestData   WxProcessedRetrieval
+	LocLatitude  float32
+	LocLongitude float32
+
+	DbClient  *influxdb3.Client
+	WaitExit sync.WaitGroup
 }
 
 type WxDbRead struct {
 	RawJsonData []byte
 }
 
-const WXDB_FILENAME = "/home/ubuntu/wxdb.txt"
+func JsonToInfluxDbPoint(processedData WxProcessedRetrieval) (point *influxdb3.Point, err error) {
+	loc, _ := time.LoadLocation("America/Los_Angeles")
+	parsedTime, err := time.ParseInLocation(time.DateTime, processedData.ReceiveTime, loc)
+	if err != nil {
+		return nil, err
+	}
+
+	point = influxdb3.NewPointWithMeasurement(processedData.ModelName).
+		SetTag("version", "wx1").
+		SetField("id", processedData.Id).
+		SetField("temperature_C", processedData.Temperature).
+		SetField("humidity", processedData.Humidity).
+		SetField("wind_max_m_s", processedData.WindMax).
+		SetField("wind_avg_m_s", processedData.WindAvg).
+		SetField("wind_dir_deg", processedData.WindDir).
+		SetField("rain_mm", processedData.RainTotal).
+		SetField("light_lux", processedData.LightLux).
+		SetField("uvi", processedData.UvIndex).
+		SetTimestamp(parsedTime.UTC())
+
+	return
+}
 
 func (data *WxFetcher) fetchRemoteWxData() {
 	get, err := http.Get("http://0.0.0.0:8433/stream")
@@ -75,6 +107,8 @@ func (data *WxFetcher) fetchRemoteWxData() {
 	dec := json.NewDecoder(get.Body)
 
 	for dec.More() {
+		data.WaitExit.Add(1)
+		defer data.WaitExit.Done()
 		var processedData WxProcessedRetrieval
 
 		// get base brunner data.
@@ -90,39 +124,154 @@ func (data *WxFetcher) fetchRemoteWxData() {
 		}
 
 		processedData.WxBrunner7in1Retrieval = dataInterface
+
 		// calculate some extra points.
 		processedData.Dewpoint = utils.Dewpoint(dataInterface.Temperature, dataInterface.Humidity)
 		// processedData.HeatIndex = heatIndexCalculation(dataInterface)
 
-		data, err := json.Marshal(processedData)
+		pointInDbForm, err := JsonToInfluxDbPoint(processedData)
 		if err != nil {
-			log.Fatal(err)
+			log.Print(err)
+			continue
 		}
 
-		db.WriteData(WXDB_FILENAME, string(data))
+		pointAsPoints := []*influxdb3.Point{pointInDbForm}
+		err = db.Write(data.DbClient, pointAsPoints)
+		if err != nil {
+			log.Print(err)
+			continue
+		}
+
+		log.Printf("wrote point to db successfully")
+
+		time.Sleep(7 * time.Second)
+	}
+}
+
+func (data *WxFetcher) setupWxDatabaseConn() {
+	url := os.Getenv("INFLUX_HOST")
+	token := os.Getenv("INFLUX_TOKEN")
+	database := os.Getenv("INFLUX_DATABASE")
+
+	client, err := influxdb3.New(influxdb3.ClientConfig{
+		Host:     url,
+		Token:    token,
+		Database: database,
+	})
+
+	defer func(client *influxdb3.Client) {
+		err := client.Close()
+		if err != nil {
+			panic(err)
+		}
+		log.Printf("closing db conn")
+	}(client)
+
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	data.DbClient = client
+	log.Printf("got db connection")
+}
+
+func (data *WxFetcher) importJsonDbData(jsondb string) {
+	dbReadFull := db.ReadOld(jsondb)
+	log.Printf("read db at jsondb %v of size %v", jsondb, len(dbReadFull))
+
+	var wxDbRead []WxProcessedRetrieval
+	json.Unmarshal(dbReadFull, &wxDbRead)
+
+	var pointsList []*influxdb3.Point = nil
+
+	insertDb := func(client *influxdb3.Client, pointsList []*influxdb3.Point) {
+		err := db.Write(client, pointsList)
+		if err != nil {
+			log.Fatalf("db write error %v", err)
+		}
+	}
+
+	for i, elem := range wxDbRead {
+		pointDbForm, err := JsonToInfluxDbPoint(elem)
+		if err != nil {
+			log.Fatalf("error %v", err)
+		}
+
+		pointsList = append(pointsList, pointDbForm)
+
+		if i%25000 == 0 {
+			insertDb(data.DbClient, pointsList)
+
+			log.Printf("inserted %v", len(pointsList))
+			pointsList = nil
+		}
+	}
+
+	// finish pointsList < 100
+	if pointsList != nil {
+		insertDb(data.DbClient, pointsList)
+		log.Printf("inserted %v", len(pointsList))
 	}
 }
 
 func main() {
-	var wxFetch WxFetcher
+	importParse := flag.Bool("import", false, "import wxdb json data to database")
+	jsonDbPath := flag.String("jsondb", "wxdb.txt", "json db path for importing")
+	// latVal := flag.Float64("latitude", 42.3804, "location latitude")
+	// lonVal := flag.Float64("longitude", -103.4369, "location longitude")
+	flag.Parse()
 
-	httpHdlr := http.NewServeMux()
-	httpHdlr.HandleFunc("GET /", httpHandler(wxFetch.healthCheck))
-	httpHdlr.HandleFunc("GET /latest", httpHandler(wxFetch.httpEntry))
+	// err := wxgov.GetWideAreaWeatherParams(*latVal, *lonVal)
+	// if err != nil {
+	// 	log.Fatalf("got error with point metadata: %v", err)
+	// }
+
+	// return
+
+	var wxFetch WxFetcher
+	NeedsExit := make(chan os.Signal, 1)
+
+	// support a graceful shutdown.
+	signal.Notify(NeedsExit, os.Interrupt)
+	signal.Notify(NeedsExit, syscall.SIGTERM)
+	go func() {
+		<-NeedsExit
+		log.Printf("shutting down wxfetcher")
+		wxFetch.WaitExit.Wait()
+		os.Exit(0)
+	}()
+
+	wxFetch.setupWxDatabaseConn()
+
+	if *importParse && *jsonDbPath != "" {
+		log.Printf("importing json db data.")
+		wxFetch.importJsonDbData(*jsonDbPath)
+	}
 
 	// start our fetcher for wx data from rtl_433
 	go wxFetch.fetchRemoteWxData()
 
-	httpServer := &http.Server{
-		Addr:    ":8080",
-		Handler: httpHdlr,
-	}
+	// wxFetch.LocLatitude = float32(*latVal)
+	// wxFetch.LocLongitude = float32(*lonVal)
 
-	log.Printf("listening on 8080")
-	err := httpServer.ListenAndServe()
-	if err != nil {
-		log.Fatalf("error with listening on http server: %s", err)
-	}
+	// httpHdlr := http.NewServeMux()
+	// httpHdlr.HandleFunc("GET /", httpHandler(wxFetch.healthCheck))
+	// httpHdlr.HandleFunc("GET /latest", httpHandler(wxFetch.httpEntry))
+
+	// start our fetcher for wx data from rtl_433
+	// go wxFetch.fetchRemoteWxData()
+
+	// httpServer := &http.Server{
+	// 	Addr:    ":8080",
+	// 	Handler: httpHdlr,
+	// }
+
+	// log.Printf("listening on 8080")
+	// err := httpServer.ListenAndServe()
+	// if err != nil {
+	// 	log.Fatalf("error with listening on http server: %s", err)
+	// }*/
 }
 
 func (data *WxFetcher) healthCheck(res http.ResponseWriter, req *http.Request) {
@@ -138,7 +287,7 @@ func (data *WxFetcher) httpEntry(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	requestFromTime, err := strconv.Atoi(req.URL.Query().Get("from"))
+	/*requestFromTime, err := strconv.Atoi(req.URL.Query().Get("from"))
 	if err != nil {
 		log.Printf("from time error.")
 		res.WriteHeader(http.StatusInternalServerError)
@@ -150,53 +299,73 @@ func (data *WxFetcher) httpEntry(res http.ResponseWriter, req *http.Request) {
 		log.Printf("to time error.")
 		res.WriteHeader(http.StatusInternalServerError)
 		return
-	}
+	}*/
 
-	dbReadFull := db.Read(WXDB_FILENAME)
-	var wxDbData []WxProcessedRetrieval
+	/*dbReadFull := db.Read(WXDB_FILENAME)
 
-	log.Printf("after db read")
-
-	err = json.Unmarshal(dbReadFull, &wxDbData)
+	var p fastjson.Parser
+	pj, err := p.Parse(string(dbReadFull))
 	if err != nil {
-		log.Printf("failed to unmarshal db json data. %v", err)
+		log.Printf("failed to parse db json data. %v", err)
 		res.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	obj, err := pj.Array()
+	if err != nil {
+		log.Fatalf("cannot obtain object from json value: %s", err)
+	}
+
 	var startIndex = 0
-	var endIndex = len(wxDbData) - 1
+	var endIndex = len(obj) - 1
+	const INCREMENT = 3
 
-	for i, elem := range wxDbData {
-		if i%4 == 0 {
-			continue
-		}
-
+	for i, elem := range obj {
 		loc, _ := time.LoadLocation("America/Los_Angeles")
-		time, err := time.ParseInLocation(time.DateTime, elem.ReceiveTime, loc)
+		parsedTime, err := time.ParseInLocation(time.DateTime, string(elem.GetStringBytes("time")), loc)
 		if err != nil {
 			log.Printf("failed to parse time entry at +%v %v", i, err)
 			res.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		if math.Abs(float64(requestFromTime)-float64(time.UTC().Unix())) < 12*1.5 {
+		// limit to 6 hours ago.
+		timeLimitUnix := time.Now().Add(-time.Hour * time.Duration(3)).UTC().Unix()
+
+		result := math.Abs(float64(timeLimitUnix) - float64(parsedTime.UTC().Unix()))
+		// log.Printf("%v %v", string(elem.GetStringBytes("time")), result)
+
+		if result < 36 {
 			startIndex = i
 		}
 
-		if math.Abs(float64(requestToTime)-float64(time.UTC().Unix())) < 12*1.5 {
+		/*log.Printf("from time: %v %v to: %v", requestFromTime, parsedTime.UTC().Unix(), requestToTime)
+		if math.Abs(float64(requestFromTime)-float64(parsedTime.UTC().Unix())) < 36 {
+			startIndex = i
+		}
+
+		if math.Abs(float64(requestToTime)-float64(parsedTime.UTC().Unix())) < 36 {
 			endIndex = i
 		}
 	}
 
-	jsonStr, err := json.Marshal(wxDbData[startIndex:endIndex])
-	if err != nil {
-		log.Printf("failed to marshal json data. %v", err)
-		res.WriteHeader(http.StatusInternalServerError)
-		return
+	log.Printf("startIndex %v endIndex %v", startIndex, endIndex)
+
+	// crude json array format return.
+	var jsonStr []byte
+	jsonStr = []byte("[")
+
+	for i := startIndex; i < endIndex; i += INCREMENT {
+		jsonStr = obj[i].MarshalTo(jsonStr)
+		if (i + INCREMENT) < endIndex {
+			jsonStr = append(jsonStr, byte(','))
+		}
 	}
 
-	res.Write([]byte(jsonStr))
+	jsonStr = append(jsonStr, byte(']'))
+
+	res.Header().Add("Content-Type", "application/json")
+	res.Write([]byte(jsonStr))*/
 }
 
 func httpHandler(next http.HandlerFunc) http.HandlerFunc {

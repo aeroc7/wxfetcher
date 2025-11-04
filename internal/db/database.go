@@ -1,12 +1,21 @@
 package db
 
 import (
+	"context"
 	"log"
 	"os"
 	"strings"
+
+	"github.com/InfluxCommunity/influxdb3-go/v2/influxdb3"
+	"github.com/influxdata/line-protocol/v2/lineprotocol"
 )
 
-func Read(filename string) (out []byte) {
+func Write(client *influxdb3.Client, points []*influxdb3.Point) (err error) {
+	err = client.WritePoints(context.Background(), points, influxdb3.WithPrecision(lineprotocol.Second))
+	return
+}
+
+func ReadOld(filename string) (out []byte) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		log.Fatal(err)
@@ -33,7 +42,7 @@ func Read(filename string) (out []byte) {
 	return []byte(jsonArrBuilder.String())
 }
 
-func WriteData(filename string, jsonStr string) {
+func WriteDataOld(filename string, jsonStr string) {
 	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatal(err)
