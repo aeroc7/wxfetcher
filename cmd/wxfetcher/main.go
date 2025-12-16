@@ -31,6 +31,15 @@ type WxBrunner7in1Retrieval struct {
 	Battery     int     `json:"battery_ok"`    // bool
 }
 
+// device 1 is an esp32 / bmp390 (among other things) situated indoors
+// to measure room temp and atmospheric pressure
+type WxDev1Retrieval struct {
+	ReceiveTime string  `json:"unix_time"`
+	ModelName   string  `json:"model"`
+	Temperature float32 `json:"temperature_C"`
+	Pressure    float32 `json:"pressure_Pa"`
+}
+
 type WxProcessedRetrieval struct {
 	WxBrunner7in1Retrieval
 	Dewpoint float32 `json:"dewpoint_C"` // C
@@ -168,45 +177,6 @@ func (data *WxFetcher) setupWxDatabaseConn() (err error) {
 	return nil
 }
 
-func (data *WxFetcher) importJsonDbData(jsondb string) {
-	dbReadFull := db.ReadOld(jsondb)
-	log.Printf("read db at jsondb %v of size %v", jsondb, len(dbReadFull))
-
-	var wxDbRead []WxProcessedRetrieval
-	json.Unmarshal(dbReadFull, &wxDbRead)
-
-	var pointsList []*influxdb3.Point = nil
-
-	insertDb := func(client *influxdb3.Client, pointsList []*influxdb3.Point) {
-		err := db.Write(client, pointsList)
-		if err != nil {
-			log.Fatalf("db write error %v", err)
-		}
-	}
-
-	for i, elem := range wxDbRead {
-		pointDbForm, err := JsonToInfluxDbPoint(elem)
-		if err != nil {
-			log.Fatalf("error %v", err)
-		}
-
-		pointsList = append(pointsList, pointDbForm)
-
-		if i%25000 == 0 {
-			insertDb(data.DbClient, pointsList)
-
-			log.Printf("inserted %v", len(pointsList))
-			pointsList = nil
-		}
-	}
-
-	// finish pointsList < 100
-	if pointsList != nil {
-		insertDb(data.DbClient, pointsList)
-		log.Printf("inserted %v", len(pointsList))
-	}
-}
-
 func shutdownMessage() {
 	NeedsExit := make(chan os.Signal, 1)
 
@@ -220,8 +190,6 @@ func shutdownMessage() {
 }
 
 func main() {
-	importParse := flag.Bool("import", false, "import wxdb json data to database")
-	jsonDbPath := flag.String("jsondb", "wxdb.txt", "json db path for importing")
 	flag.Parse()
 
 	var wxFetch WxFetcher
@@ -230,11 +198,6 @@ func main() {
 	err := wxFetch.setupWxDatabaseConn()
 	if err != nil {
 		log.Fatalf("database failed to initialize")
-	}
-
-	if *importParse && *jsonDbPath != "" {
-		log.Printf("importing json db data.")
-		wxFetch.importJsonDbData(*jsonDbPath)
 	}
 
 	// start our fetcher for wx data from rtl_433
