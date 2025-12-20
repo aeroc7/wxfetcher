@@ -1,6 +1,6 @@
-## WxFetcher works with rtl_433 to retrieve and manage data from a weather station.
+# WxFetcher ingests environment sensor data
 
-Data is stored in InfluxDB and queried with a Grafana frontend:
+WxFetcher ingests data (using rtl_433) from an outdoor weather station, in addition to multiple independent sensors ran by an esp32 (including a BMP390 and SCD30). Data is stored in InfluxDB and queried with a Grafana frontend:
 
 <img width="1900" height="1045" alt="image" src="https://github.com/user-attachments/assets/e221d5db-817e-4f60-82b0-0c34d9786dbf" />
 
